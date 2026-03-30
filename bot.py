@@ -6,7 +6,14 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Iterable, Optional
 
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -32,6 +39,19 @@ VALID_MODES = {WORK_MODE_OFFICE, WORK_MODE_HOME}
 WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 CAL_SELECTED_DAYS_KEY = "cal_selected_days"
 CAL_CURRENT_MONTH_KEY = "cal_current_month"
+
+TEAM_NAMES = (
+    "Игорь",
+    "Ваня",
+    "Оля",
+    "Карина",
+    "Настя",
+    "Беслан",
+    "Влад",
+    "Илья",
+)
+TEAM_NAMES_SET = frozenset(TEAM_NAMES)
+
 MAIN_COMMAND_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["/calendar", "/day", "/week"],
@@ -47,6 +67,7 @@ class UserRecord:
     user_id: int
     username: str
     full_name: str
+    display_name: Optional[str]
     is_active: int
 
 
@@ -74,6 +95,10 @@ class ScheduleDB:
                 )
                 """
             )
+            try:
+                conn.execute("ALTER TABLE users ADD COLUMN display_name TEXT")
+            except sqlite3.OperationalError:
+                pass
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS schedules (
@@ -126,18 +151,30 @@ class ScheduleDB:
                 (user_id, username, full_name, now, now),
             )
 
+    def set_display_name(self, user_id: int, display_name: str) -> None:
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE users SET display_name=?, updated_at=? WHERE user_id=?
+                """,
+                (display_name, now, user_id),
+            )
+
     def get_user(self, user_id: int) -> Optional[UserRecord]:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT user_id, username, full_name, is_active FROM users WHERE user_id=?",
+                "SELECT user_id, username, full_name, display_name, is_active FROM users WHERE user_id=?",
                 (user_id,),
             ).fetchone()
             if row is None:
                 return None
+            dn = row["display_name"]
             return UserRecord(
                 user_id=row["user_id"],
                 username=row["username"] or "",
                 full_name=row["full_name"],
+                display_name=dn if dn else None,
                 is_active=row["is_active"],
             )
 
@@ -154,10 +191,10 @@ class ScheduleDB:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT user_id, username, full_name, is_active
+                SELECT user_id, username, full_name, display_name, is_active
                 FROM users
                 WHERE is_active=1
-                ORDER BY full_name COLLATE NOCASE ASC
+                ORDER BY COALESCE(display_name, full_name) COLLATE NOCASE ASC
                 """
             ).fetchall()
             return [
@@ -165,6 +202,7 @@ class ScheduleDB:
                     user_id=row["user_id"],
                     username=row["username"] or "",
                     full_name=row["full_name"],
+                    display_name=(row["display_name"] if row["display_name"] else None),
                     is_active=row["is_active"],
                 )
                 for row in rows
@@ -303,15 +341,67 @@ def require_active_user(user: UserRecord) -> bool:
     return user.is_active == 1
 
 
+def profile_complete(user: UserRecord) -> bool:
+    return bool(user.display_name and str(user.display_name).strip())
+
+
+def user_public_name(user: UserRecord) -> str:
+    if user.display_name and str(user.display_name).strip():
+        return str(user.display_name).strip()
+    return user.full_name
+
+
+def build_name_keyboard() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    names = list(TEAM_NAMES)
+    for i in range(0, len(names), 2):
+        row = [InlineKeyboardButton(names[i], callback_data=f"name:{names[i]}")]
+        if i + 1 < len(names):
+            row.append(InlineKeyboardButton(names[i + 1], callback_data=f"name:{names[i + 1]}"))
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def welcome_after_onboarding_html(user: UserRecord) -> str:
+    name = user_public_name(user)
+    return (
+        f"<b>{name}</b>\n"
+        "Календарь — дни «дом». Будни без отметки — офис. Сб и Вс — выходной.\n\n"
+        "<code>/calendar</code>  <code>/day</code>  <code>/week</code>\n"
+        "<code>/myday</code>  <code>/participants</code>  <code>/name</code>"
+    )
+
+
+async def prompt_choose_name_message(update: Update) -> None:
+    msg = update.effective_message
+    if msg is None:
+        return
+    await msg.reply_text("\u2060", reply_markup=ReplyKeyboardRemove())
+    await msg.reply_text(
+        "<b>Офис · расписание</b>\n\nКто ты?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_name_keyboard(),
+    )
+
+
+async def prompt_choose_name_callback(query) -> None:
+    await query.edit_message_text(
+        "<b>Офис · расписание</b>\n\nСначала выбери имя — команда /start",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 def render_day(db: ScheduleDB, day: date) -> str:
     rows = db.list_active_users()
-    lines = [f"📅 <b>{day.strftime('%d.%m.%Y (%A)')}</b>"]
+    lines = [f"<b>{day.strftime('%d.%m.%Y · %A')}</b>"]
     if not rows:
         lines.append("Пока нет участников.")
         return "\n".join(lines)
     for row in rows:
         username = f"@{row.username}" if row.username else f"id:{row.user_id}"
-        lines.append(f"- {row.full_name} ({username}): <b>{mode_label(day_status(db, row.user_id, day))}</b>")
+        lines.append(
+            f"— {user_public_name(row)} ({username}) · <b>{mode_label(day_status(db, row.user_id, day))}</b>"
+        )
     return "\n".join(lines)
 
 
@@ -409,9 +499,9 @@ def build_month_keyboard(
     next_y, next_m = shift_month(year, month, 1)
     keyboard.append(
         [
-            InlineKeyboardButton("⬅️", callback_data=f"cal:nav:{prev_y:04d}-{prev_m:02d}"),
+            InlineKeyboardButton("‹", callback_data=f"cal:nav:{prev_y:04d}-{prev_m:02d}"),
             InlineKeyboardButton("Закрыть", callback_data="cal:close"),
-            InlineKeyboardButton("➡️", callback_data=f"cal:nav:{next_y:04d}-{next_m:02d}"),
+            InlineKeyboardButton("›", callback_data=f"cal:nav:{next_y:04d}-{next_m:02d}"),
         ]
     )
     return InlineKeyboardMarkup(keyboard)
@@ -452,21 +542,23 @@ def resolve_user_for_removal(db: ScheduleDB, ref: str) -> Optional[UserRecord]:
     with db._connect() as conn:
         if ref.isdigit():
             row = conn.execute(
-                "SELECT user_id, username, full_name, is_active FROM users WHERE user_id=?",
+                "SELECT user_id, username, full_name, display_name, is_active FROM users WHERE user_id=?",
                 (int(ref),),
             ).fetchone()
         else:
             username = normalize_username(ref)
             row = conn.execute(
-                "SELECT user_id, username, full_name, is_active FROM users WHERE username=?",
+                "SELECT user_id, username, full_name, display_name, is_active FROM users WHERE username=?",
                 (username,),
             ).fetchone()
         if row is None:
             return None
+        dn = row["display_name"]
         return UserRecord(
             user_id=row["user_id"],
             username=row["username"] or "",
             full_name=row["full_name"],
+            display_name=dn if dn else None,
             is_active=row["is_active"],
         )
 
@@ -474,31 +566,96 @@ def resolve_user_for_removal(db: ScheduleDB, ref: str) -> Optional[UserRecord]:
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db: ScheduleDB = context.application.bot_data["db"]
     user = ensure_registered_user(update, db)
-    status = "активен" if user.is_active == 1 else "неактивен"
+    if not require_active_user(user):
+        await update.message.reply_text("Доступ отключён. Напиши администратору.")
+        return
+    if not profile_complete(user):
+        await prompt_choose_name_message(update)
+        return
+    user = db.get_user(user.user_id)
+    if user is None:
+        return
     await update.message.reply_text(
-        "Привет! Ты зарегистрирован в расписании.\n"
-        f"Статус: {status}\n\n"
-        "Команды:\n"
-        "/calendar [YYYY-MM] — отметить дни из дома в календаре\n"
-        "/set YYYY-MM-DD office|home — ручной ввод (совместимость)\n"
-        "/day [YYYY-MM-DD] — расписание на день\n"
-        "/week [YYYY-MM-DD] — расписание на неделю\n"
-        "/myday [YYYY-MM-DD] — моя запись на день\n"
-        "/delete YYYY-MM-DD — удалить свою запись\n"
-        "/participants — список участников\n"
-        "/menu — показать кнопки\n"
-        "/help — помощь",
+        welcome_after_onboarding_html(user),
+        parse_mode=ParseMode.HTML,
         reply_markup=MAIN_COMMAND_KEYBOARD,
     )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await start_cmd(update, context)
+    db: ScheduleDB = context.application.bot_data["db"]
+    user = ensure_registered_user(update, db)
+    if not require_active_user(user):
+        await update.message.reply_text("Доступ отключён.")
+        return
+    if not profile_complete(user):
+        await prompt_choose_name_message(update)
+        return
+    user = db.get_user(user.user_id)
+    if user is None:
+        return
+    await update.message.reply_text(
+        welcome_after_onboarding_html(user),
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_COMMAND_KEYBOARD,
+    )
 
 
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ensure_registered_user(update, context.application.bot_data["db"])
-    await update.message.reply_text("Кнопки команд включены.", reply_markup=MAIN_COMMAND_KEYBOARD)
+    db: ScheduleDB = context.application.bot_data["db"]
+    user = ensure_registered_user(update, db)
+    if not profile_complete(user):
+        await prompt_choose_name_message(update)
+        return
+    await update.message.reply_text("Команды", reply_markup=MAIN_COMMAND_KEYBOARD)
+
+
+async def name_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db: ScheduleDB = context.application.bot_data["db"]
+    user = ensure_registered_user(update, db)
+    if not require_active_user(user):
+        await update.message.reply_text("Доступ отключён.")
+        return
+    await update.message.reply_text("\u2060", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(
+        "<b>Кто ты?</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_name_keyboard(),
+    )
+
+
+async def name_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.message is None or query.data is None:
+        return
+    await query.answer()
+    db: ScheduleDB = context.application.bot_data["db"]
+    user = ensure_registered_user(update, db)
+    if not require_active_user(user):
+        await query.edit_message_text("Доступ отключён.")
+        return
+
+    data = query.data
+    if not data.startswith("name:"):
+        return
+    raw = data[5:]
+    if raw not in TEAM_NAMES_SET:
+        await query.answer("Неверный выбор", show_alert=True)
+        return
+
+    db.set_display_name(user.user_id, raw)
+    refreshed = db.get_user(user.user_id)
+    if refreshed is None:
+        return
+    await query.edit_message_text(
+        f"<b>{raw}</b> · сохранено",
+        parse_mode=ParseMode.HTML,
+    )
+    await query.message.reply_text(
+        welcome_after_onboarding_html(refreshed),
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_COMMAND_KEYBOARD,
+    )
 
 
 async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -506,6 +663,9 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = ensure_registered_user(update, db)
     if not require_active_user(user):
         await update.message.reply_text("Ты отключен администратором. Обратись к администратору.")
+        return
+    if not profile_complete(user):
+        await prompt_choose_name_message(update)
         return
     if len(context.args) != 2:
         await update.message.reply_text("Формат: /set YYYY-MM-DD office|home")
@@ -532,6 +692,9 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db: ScheduleDB = context.application.bot_data["db"]
     user = ensure_registered_user(update, db)
+    if not profile_complete(user):
+        await prompt_choose_name_message(update)
+        return
     if len(context.args) != 1:
         await update.message.reply_text("Формат: /delete YYYY-MM-DD")
         return
@@ -550,6 +713,9 @@ async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def myday_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db: ScheduleDB = context.application.bot_data["db"]
     user = ensure_registered_user(update, db)
+    if not profile_complete(user):
+        await prompt_choose_name_message(update)
+        return
     try:
         day = parse_date_arg(context.args[0] if context.args else None)
     except ValueError:
@@ -567,6 +733,9 @@ async def calendar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not require_active_user(user):
         await update.message.reply_text("Ты отключен администратором. Обратись к администратору.")
         return
+    if not profile_complete(user):
+        await prompt_choose_name_message(update)
+        return
     if context.args:
         try:
             year_text, month_text = context.args[0].split("-")
@@ -583,10 +752,10 @@ async def calendar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     context.user_data[CAL_SELECTED_DAYS_KEY] = []
     first_day, last_day = month_bounds(year, month)
     text = (
-        f"📆 <b>{month_title(year, month)}</b>\n"
-        "Выбери несколько будних дней, затем примени действие кнопкой ниже.\n"
-        "Сб/Вс всегда выходные.\n\n"
-        f"Период: {first_day.isoformat()} — {last_day.isoformat()}"
+        f"<b>{month_title(year, month)}</b>\n"
+        "Несколько будней → действие внизу.\n"
+        "Сб и Вс без выбора.\n\n"
+        f"{first_day.isoformat()} — {last_day.isoformat()}"
     )
     await update.message.reply_text(
         text,
@@ -605,6 +774,9 @@ async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not require_active_user(user):
         await query.edit_message_text("Ты отключен администратором. Обратись к администратору.")
         return
+    if not profile_complete(user):
+        await prompt_choose_name_callback(query)
+        return
 
     data = query.data
     if data == "cal:noop":
@@ -620,10 +792,10 @@ async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data[CAL_SELECTED_DAYS_KEY] = []
         first_day, last_day = month_bounds(year, month)
         text = (
-            f"📆 <b>{month_title(year, month)}</b>\n"
-            "Выбери несколько будних дней, затем примени действие кнопкой ниже.\n"
-            "Сб/Вс всегда выходные.\n\n"
-            f"Период: {first_day.isoformat()} — {last_day.isoformat()}"
+            f"<b>{month_title(year, month)}</b>\n"
+            "Несколько будней → действие внизу.\n"
+            "Сб и Вс без выбора.\n\n"
+            f"{first_day.isoformat()} — {last_day.isoformat()}"
         )
         await query.edit_message_text(
             text,
@@ -642,10 +814,9 @@ async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         month = int(month_text)
         first_day, last_day = month_bounds(year, month)
         text = (
-            f"📆 <b>{month_title(year, month)}</b>\n"
-            "Выбор очищен.\n"
-            "Сб/Вс всегда выходные.\n\n"
-            f"Период: {first_day.isoformat()} — {last_day.isoformat()}"
+            f"<b>{month_title(year, month)}</b>\n"
+            "Выбор сброшен.\n\n"
+            f"{first_day.isoformat()} — {last_day.isoformat()}"
         )
         await query.edit_message_text(
             text,
@@ -672,10 +843,9 @@ async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data[CAL_SELECTED_DAYS_KEY] = sorted(selected_days)
         first_day, last_day = month_bounds(picked_day.year, picked_day.month)
         text = (
-            f"📆 <b>{month_title(picked_day.year, picked_day.month)}</b>\n"
-            f"Выбрано дней: <b>{len(selected_days)}</b>\n"
-            "Сб/Вс всегда выходные.\n\n"
-            f"Период: {first_day.isoformat()} — {last_day.isoformat()}"
+            f"<b>{month_title(picked_day.year, picked_day.month)}</b>\n"
+            f"Выбрано: <b>{len(selected_days)}</b>\n\n"
+            f"{first_day.isoformat()} — {last_day.isoformat()}"
         )
         await query.edit_message_text(
             text,
@@ -708,12 +878,11 @@ async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             changed += 1
         context.user_data[CAL_SELECTED_DAYS_KEY] = []
         first_day, last_day = month_bounds(year, month)
-        action_label = "назначены как Дом" if is_apply else "сняты с Дома"
+        action_label = "дом" if is_apply else "снято"
         text = (
-            f"📆 <b>{month_title(year, month)}</b>\n"
-            f"Обновлено дней: <b>{changed}</b> ({action_label})\n"
-            "Сб/Вс всегда выходные.\n\n"
-            f"Период: {first_day.isoformat()} — {last_day.isoformat()}"
+            f"<b>{month_title(year, month)}</b>\n"
+            f"Изменено дней: <b>{changed}</b> ({action_label})\n\n"
+            f"{first_day.isoformat()} — {last_day.isoformat()}"
         )
         await query.edit_message_text(
             text,
@@ -731,9 +900,9 @@ async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         else:
             db.set_home_day(user.user_id, picked_day.isoformat())
         text = (
-            f"🛠 <b>{picked_day.strftime('%d.%m.%Y (%A)')}</b>\n"
-            f"Текущий статус: <b>{mode_label(day_status(db, user.user_id, picked_day))}</b>\n"
-            "Выбери действие:"
+            f"<b>{picked_day.strftime('%d.%m.%Y · %A')}</b>\n"
+            f"Статус: <b>{mode_label(day_status(db, user.user_id, picked_day))}</b>\n"
+            "Действие:"
         )
         await query.edit_message_text(
             text,
@@ -752,9 +921,9 @@ async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         else:
             db.set_weekly_home_day(user.user_id, weekday)
         text = (
-            f"🛠 <b>{picked_day.strftime('%d.%m.%Y (%A)')}</b>\n"
-            f"Текущий статус: <b>{mode_label(day_status(db, user.user_id, picked_day))}</b>\n"
-            "Выбери действие:"
+            f"<b>{picked_day.strftime('%d.%m.%Y · %A')}</b>\n"
+            f"Статус: <b>{mode_label(day_status(db, user.user_id, picked_day))}</b>\n"
+            "Действие:"
         )
         await query.edit_message_text(
             text,
@@ -766,7 +935,10 @@ async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def day_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db: ScheduleDB = context.application.bot_data["db"]
-    ensure_registered_user(update, db)
+    user = ensure_registered_user(update, db)
+    if not profile_complete(user):
+        await prompt_choose_name_message(update)
+        return
     try:
         day = parse_date_arg(context.args[0] if context.args else None)
     except ValueError:
@@ -777,7 +949,10 @@ async def day_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db: ScheduleDB = context.application.bot_data["db"]
-    ensure_registered_user(update, db)
+    user = ensure_registered_user(update, db)
+    if not profile_complete(user):
+        await prompt_choose_name_message(update)
+        return
     try:
         anchor = parse_date_arg(context.args[0] if context.args else None)
     except ValueError:
@@ -785,7 +960,7 @@ async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     start, end = week_bounds(anchor)
-    parts = [f"🗓 <b>Неделя {start.isoformat()} — {end.isoformat()}</b>"]
+    parts = [f"<b>Неделя {start.isoformat()} — {end.isoformat()}</b>"]
     for day in iter_week_days(anchor):
         parts.append("")
         parts.append(render_day(db, day))
@@ -794,16 +969,19 @@ async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def participants_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db: ScheduleDB = context.application.bot_data["db"]
-    ensure_registered_user(update, db)
+    user = ensure_registered_user(update, db)
+    if not profile_complete(user):
+        await prompt_choose_name_message(update)
+        return
     users = db.list_active_users()
     if not users:
         await update.message.reply_text("Нет активных участников.")
         return
-    lines = ["👥 Активные участники:"]
+    lines = ["<b>Участники</b>"]
     for u in users:
         username = f"@{u.username}" if u.username else f"id:{u.user_id}"
-        lines.append(f"- {u.full_name} ({username})")
-    await update.message.reply_text("\n".join(lines))
+        lines.append(f"— {user_public_name(u)} · {username}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def remove_participant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -828,7 +1006,7 @@ async def remove_participant_cmd(update: Update, context: ContextTypes.DEFAULT_T
         return
     db.deactivate_user(target.user_id)
     username = f"@{target.username}" if target.username else f"id:{target.user_id}"
-    await update.message.reply_text(f"Участник отключен: {target.full_name} ({username})")
+    await update.message.reply_text(f"Отключён: {user_public_name(target)} ({username})")
 
 
 async def unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -845,13 +1023,14 @@ def require_env(name: str) -> str:
 async def post_init(app: Application) -> None:
     await app.bot.set_my_commands(
         [
-            BotCommand("start", "Запуск и регистрация"),
-            BotCommand("calendar", "Календарь дней из дома"),
-            BotCommand("day", "Расписание на день"),
-            BotCommand("week", "Расписание на неделю"),
-            BotCommand("myday", "Мой статус на день"),
-            BotCommand("participants", "Список участников"),
-            BotCommand("menu", "Показать кнопки команд"),
+            BotCommand("start", "Старт и имя"),
+            BotCommand("name", "Сменить имя"),
+            BotCommand("calendar", "Календарь"),
+            BotCommand("day", "День"),
+            BotCommand("week", "Неделя"),
+            BotCommand("myday", "Мой статус"),
+            BotCommand("participants", "Участники"),
+            BotCommand("menu", "Кнопки команд"),
             BotCommand("help", "Помощь"),
         ]
     )
@@ -872,6 +1051,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("name", name_cmd))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("calendar", calendar_cmd))
     app.add_handler(CommandHandler("set", set_cmd))
@@ -881,6 +1061,7 @@ def main() -> None:
     app.add_handler(CommandHandler("week", week_cmd))
     app.add_handler(CommandHandler("participants", participants_cmd))
     app.add_handler(CommandHandler("remove_participant", remove_participant_cmd))
+    app.add_handler(CallbackQueryHandler(name_callback, pattern=r"^name:"))
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal:"))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
 
