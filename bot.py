@@ -1,10 +1,10 @@
-import calendar
 import logging
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from typing import Iterable, Optional
+from datetime import date, datetime, time, timedelta
+from typing import Optional
+from zoneinfo import ZoneInfo
 
 from telegram import (
     BotCommand,
@@ -37,10 +37,6 @@ logger = logging.getLogger(__name__)
 WORK_MODE_OFFICE = "office"
 WORK_MODE_HOME = "home"
 WORK_MODE_OFF = "off"
-VALID_MODES = {WORK_MODE_OFFICE, WORK_MODE_HOME}
-WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-CAL_SELECTED_DAYS_KEY = "cal_selected_days"
-CAL_CURRENT_MONTH_KEY = "cal_current_month"
 
 TEAM_NAMES = (
     "Игорь",
@@ -54,26 +50,17 @@ TEAM_NAMES = (
 )
 TEAM_NAMES_SET = frozenset(TEAM_NAMES)
 
+
 def main_reply_keyboard() -> ReplyKeyboardMarkup:
     url = os.getenv("MINIAPP_URL", "").strip()
     row_a: list[KeyboardButton] = []
     if url:
         row_a.append(KeyboardButton("Приложение", web_app=WebAppInfo(url=url)))
-    row_a.extend(
-        [
-            KeyboardButton("/calendar"),
-            KeyboardButton("/day"),
-        ]
-    )
+    row_a.append(KeyboardButton("/participants"))
     return ReplyKeyboardMarkup(
         [
             row_a,
-            [
-                KeyboardButton("/week"),
-                KeyboardButton("/myday"),
-                KeyboardButton("/participants"),
-            ],
-            [KeyboardButton("/help")],
+            [KeyboardButton("/name"), KeyboardButton("/help")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -236,7 +223,6 @@ class ScheduleDB:
                 """,
                 (user_id, work_date, now),
             )
-            # Cleanup legacy office entries for this date.
             conn.execute(
                 "DELETE FROM schedules WHERE user_id=? AND work_date=? AND mode='office'",
                 (user_id, work_date),
@@ -248,7 +234,6 @@ class ScheduleDB:
                 "DELETE FROM home_days WHERE user_id=? AND work_date=?",
                 (user_id, work_date),
             )
-            # Backward compatibility for previous model.
             conn.execute(
                 "DELETE FROM schedules WHERE user_id=? AND work_date=?",
                 (user_id, work_date),
@@ -313,33 +298,6 @@ def normalize_username(username: Optional[str]) -> str:
     return username.strip().lstrip("@")
 
 
-def mode_label(mode: Optional[str]) -> str:
-    if mode == WORK_MODE_OFFICE:
-        return "Офис"
-    if mode == WORK_MODE_HOME:
-        return "Дом"
-    if mode == WORK_MODE_OFF:
-        return "Выходной"
-    return "—"
-
-
-def parse_date_arg(raw: Optional[str]) -> date:
-    if raw is None or raw.strip() == "":
-        return date.today()
-    text = raw.strip().lower()
-    if text in {"today", "сегодня"}:
-        return date.today()
-    if text in {"tomorrow", "завтра"}:
-        return date.today() + timedelta(days=1)
-    return datetime.strptime(text, "%Y-%m-%d").date()
-
-
-def week_bounds(anchor: date) -> tuple[date, date]:
-    start = anchor - timedelta(days=anchor.weekday())
-    end = start + timedelta(days=6)
-    return start, end
-
-
 def ensure_registered_user(update: Update, db: ScheduleDB) -> UserRecord:
     tg_user = update.effective_user
     if tg_user is None:
@@ -369,70 +327,6 @@ def user_public_name(user: UserRecord) -> str:
     return user.full_name
 
 
-def build_name_keyboard() -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    names = list(TEAM_NAMES)
-    for i in range(0, len(names), 2):
-        row = [InlineKeyboardButton(names[i], callback_data=f"name:{names[i]}")]
-        if i + 1 < len(names):
-            row.append(InlineKeyboardButton(names[i + 1], callback_data=f"name:{names[i + 1]}"))
-        rows.append(row)
-    return InlineKeyboardMarkup(rows)
-
-
-def welcome_after_onboarding_html(user: UserRecord) -> str:
-    name = user_public_name(user)
-    extra = ""
-    if os.getenv("MINIAPP_URL", "").strip():
-        extra = "\n\nКнопка <b>Приложение</b> — календарь на весь экран."
-    return (
-        f"<b>{name}</b>\n"
-        "Календарь — дни «дом». Будни без отметки — офис. Сб и Вс — выходной.\n\n"
-        "<code>/calendar</code>  <code>/day</code>  <code>/week</code>\n"
-        "<code>/myday</code>  <code>/participants</code>  <code>/name</code>"
-        f"{extra}"
-    )
-
-
-async def prompt_choose_name_message(update: Update) -> None:
-    msg = update.effective_message
-    if msg is None:
-        return
-    await msg.reply_text("\u2060", reply_markup=ReplyKeyboardRemove())
-    await msg.reply_text(
-        "<b>Офис · расписание</b>\n\nКто ты?",
-        parse_mode=ParseMode.HTML,
-        reply_markup=build_name_keyboard(),
-    )
-
-
-async def prompt_choose_name_callback(query) -> None:
-    await query.edit_message_text(
-        "<b>Офис · расписание</b>\n\nСначала выбери имя — команда /start",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-def render_day(db: ScheduleDB, day: date) -> str:
-    rows = db.list_active_users()
-    lines = [f"<b>{day.strftime('%d.%m.%Y · %A')}</b>"]
-    if not rows:
-        lines.append("Пока нет участников.")
-        return "\n".join(lines)
-    for row in rows:
-        username = f"@{row.username}" if row.username else f"id:{row.user_id}"
-        lines.append(
-            f"— {user_public_name(row)} ({username}) · <b>{mode_label(day_status(db, row.user_id, day))}</b>"
-        )
-    return "\n".join(lines)
-
-
-def iter_week_days(anchor: date) -> Iterable[date]:
-    start, _ = week_bounds(anchor)
-    for i in range(7):
-        yield start + timedelta(days=i)
-
-
 def day_status(db: ScheduleDB, user_id: int, day: date) -> str:
     if day.weekday() >= 5:
         return WORK_MODE_OFF
@@ -441,12 +335,6 @@ def day_status(db: ScheduleDB, user_id: int, day: date) -> str:
     if db.is_weekly_home_day(user_id, day.weekday()):
         return WORK_MODE_HOME
     return WORK_MODE_OFFICE
-
-
-def month_bounds(year: int, month: int) -> tuple[date, date]:
-    first_day = date(year, month, 1)
-    _, last_num = calendar.monthrange(year, month)
-    return first_day, date(year, month, last_num)
 
 
 def month_title(year: int, month: int) -> str:
@@ -472,89 +360,41 @@ def shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
     return total // 12, total % 12 + 1
 
 
-def build_month_keyboard(
-    db: ScheduleDB,
-    user_id: int,
-    year: int,
-    month: int,
-    selected_days: set[str],
-) -> InlineKeyboardMarkup:
-    keyboard: list[list[InlineKeyboardButton]] = []
-    keyboard.append([InlineKeyboardButton(day, callback_data="cal:noop") for day in WEEKDAYS_RU])
-    for week in calendar.monthcalendar(year, month):
-        row: list[InlineKeyboardButton] = []
-        for weekday, day_num in enumerate(week):
-            if day_num == 0:
-                row.append(InlineKeyboardButton(" ", callback_data="cal:noop"))
-                continue
-            current = date(year, month, day_num)
-            iso = current.isoformat()
-            if iso in selected_days:
-                label = f"[{day_num}]"
-            else:
-                status = day_status(db, user_id, current)
-                if status == WORK_MODE_HOME:
-                    label = f"{day_num}Д"
-                elif status == WORK_MODE_OFF:
-                    label = f"{day_num}В"
-                else:
-                    label = str(day_num)
-            row.append(
-                InlineKeyboardButton(
-                    label,
-                    callback_data=f"cal:sel:{iso}",
-                )
-            )
-        keyboard.append(row)
-    keyboard.append(
-        [
-            InlineKeyboardButton("Сохранить выбранные как Дом", callback_data=f"cal:apply:{year:04d}-{month:02d}"),
-        ]
-    )
-    keyboard.append(
-        [
-            InlineKeyboardButton("Снять Дом с выбранных", callback_data=f"cal:remove:{year:04d}-{month:02d}"),
-            InlineKeyboardButton("Очистить выбор", callback_data="cal:clear"),
-        ]
-    )
-    prev_y, prev_m = shift_month(year, month, -1)
-    next_y, next_m = shift_month(year, month, 1)
-    keyboard.append(
-        [
-            InlineKeyboardButton("‹", callback_data=f"cal:nav:{prev_y:04d}-{prev_m:02d}"),
-            InlineKeyboardButton("Закрыть", callback_data="cal:close"),
-            InlineKeyboardButton("›", callback_data=f"cal:nav:{next_y:04d}-{next_m:02d}"),
-        ]
-    )
-    return InlineKeyboardMarkup(keyboard)
-
-
-def build_day_editor_keyboard(db: ScheduleDB, user_id: int, day: date) -> InlineKeyboardMarkup:
-    weekday = day.weekday()
-    is_home = db.is_home_day(user_id, day.isoformat())
-    is_weekly = weekday < 5 and db.is_weekly_home_day(user_id, weekday)
-    home_text = "Убрать 'дом' на этот день" if is_home else "Сделать этот день 'дом'"
-    weekly_text = (
-        f"Каждую неделю: {'включено' if is_weekly else 'выключено'}"
-        if weekday < 5
-        else "Каждую неделю недоступно (выходной)"
-    )
-    rows: list[list[InlineKeyboardButton]] = [
-        [InlineKeyboardButton(home_text, callback_data=f"cal:togday:{day.isoformat()}")]
-    ]
-    if weekday < 5:
-        rows.append([InlineKeyboardButton(weekly_text, callback_data=f"cal:togweek:{day.isoformat()}")])
-    else:
-        rows.append([InlineKeyboardButton(weekly_text, callback_data="cal:noop")])
-    rows.append(
-        [
-            InlineKeyboardButton(
-                "⬅️ Назад в календарь",
-                callback_data=f"cal:nav:{day.year:04d}-{day.month:02d}",
-            )
-        ]
-    )
+def build_name_keyboard() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    names = list(TEAM_NAMES)
+    for i in range(0, len(names), 2):
+        row = [InlineKeyboardButton(names[i], callback_data=f"name:{names[i]}")]
+        if i + 1 < len(names):
+            row.append(InlineKeyboardButton(names[i + 1], callback_data=f"name:{names[i + 1]}"))
+        rows.append(row)
     return InlineKeyboardMarkup(rows)
+
+
+def welcome_after_onboarding_html(user: UserRecord) -> str:
+    name = user_public_name(user)
+    extra = ""
+    if os.getenv("MINIAPP_URL", "").strip():
+        extra = "\n\nРасписание — в кнопке <b>Приложение</b>."
+    return (
+        f"<b>{name}</b>\n"
+        "Каждое утро бот пришлёт, кто в офисе сегодня и завтра "
+        "(в субботу тишина, в воскресенье — только про понедельник)."
+        f"{extra}\n\n"
+        "<code>/participants</code>  <code>/name</code>  <code>/help</code>"
+    )
+
+
+async def prompt_choose_name_message(update: Update) -> None:
+    msg = update.effective_message
+    if msg is None:
+        return
+    await msg.reply_text("\u2060", reply_markup=ReplyKeyboardRemove())
+    await msg.reply_text(
+        "<b>Офис · расписание</b>\n\nКто ты?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_name_keyboard(),
+    )
 
 
 def resolve_user_for_removal(db: ScheduleDB, ref: str) -> Optional[UserRecord]:
@@ -583,6 +423,81 @@ def resolve_user_for_removal(db: ScheduleDB, ref: str) -> Optional[UserRecord]:
             display_name=dn if dn else None,
             is_active=row["is_active"],
         )
+
+
+def join_names(names: list[str]) -> str:
+    if not names:
+        return "никого"
+    return ", ".join(names)
+
+
+def names_in_office_for_date(db: ScheduleDB, d: date) -> list[str]:
+    out: list[str] = []
+    for u in db.list_active_users():
+        if not profile_complete(u):
+            continue
+        if day_status(db, u.user_id, d) == WORK_MODE_OFFICE:
+            out.append(user_public_name(u))
+    out.sort(key=lambda s: s.lower())
+    return out
+
+
+def build_digest_text(db: ScheduleDB, today: date) -> Optional[str]:
+    """Сб — не слать. Вс — только «завтра» (пн). Пн–Пт — сегодня + завтра."""
+    wd = today.weekday()
+    if wd == 5:
+        return None
+    if wd == 6:
+        monday = today + timedelta(days=1)
+        n = names_in_office_for_date(db, monday)
+        return f"Завтра в офисе: {join_names(n)}"
+    t = names_in_office_for_date(db, today)
+    tomorrow = today + timedelta(days=1)
+    t2 = names_in_office_for_date(db, tomorrow)
+    return f"Сегодня в офисе: {join_names(t)}\n\nЗавтра в офисе: {join_names(t2)}"
+
+
+def list_digest_recipient_ids(db: ScheduleDB) -> list[int]:
+    return [u.user_id for u in db.list_active_users() if profile_complete(u)]
+
+
+async def daily_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    db: ScheduleDB = context.application.bot_data["db"]
+    tz_name = os.getenv("DIGEST_TIMEZONE", "Europe/Moscow")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    today = datetime.now(tz).date()
+    text = build_digest_text(db, today)
+    if text is None:
+        logger.debug("Digest skipped (weekend rule): %s", today.isoformat())
+        return
+    for uid in list_digest_recipient_ids(db):
+        try:
+            await context.bot.send_message(chat_id=uid, text=text)
+        except Exception as e:
+            logger.warning("Digest failed for %s: %s", uid, e)
+
+
+def register_digest_job(app: Application) -> None:
+    if os.getenv("DIGEST_ENABLED", "true").lower() in ("0", "false", "no"):
+        logger.info("Daily digest disabled (DIGEST_ENABLED)")
+        return
+    jq = app.job_queue
+    if jq is None:
+        logger.warning("JobQueue unavailable — install: pip install 'python-telegram-bot[job-queue]'")
+        return
+    tz_name = os.getenv("DIGEST_TIMEZONE", "Europe/Moscow")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    h = int(os.getenv("DIGEST_HOUR", "9"))
+    mi = int(os.getenv("DIGEST_MINUTE", "0"))
+    run_at = time(hour=h, minute=mi, tzinfo=tz)
+    jq.run_daily(daily_digest_job, time=run_at, name="daily_digest")
+    logger.info("Daily digest scheduled at %s (%s)", run_at.isoformat(), tz_name)
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -637,7 +552,7 @@ async def app_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await prompt_choose_name_message(update)
         return
     await update.message.reply_text(
-        "Открой <b>Приложение</b> — полноэкранный календарь.\nПосле выхода: /menu — обычные кнопки.",
+        "Открой <b>Приложение</b> — календарь.\nПосле выхода: /menu — кнопки.",
         parse_mode=ParseMode.HTML,
         reply_markup=ReplyKeyboardMarkup(
             [[KeyboardButton("Приложение", web_app=WebAppInfo(url=url))]],
@@ -703,315 +618,6 @@ async def name_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
-async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    db: ScheduleDB = context.application.bot_data["db"]
-    user = ensure_registered_user(update, db)
-    if not require_active_user(user):
-        await update.message.reply_text("Ты отключен администратором. Обратись к администратору.")
-        return
-    if not profile_complete(user):
-        await prompt_choose_name_message(update)
-        return
-    if len(context.args) != 2:
-        await update.message.reply_text("Формат: /set YYYY-MM-DD office|home")
-        return
-    try:
-        day = parse_date_arg(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Неверная дата. Используй формат YYYY-MM-DD")
-        return
-    mode = context.args[1].strip().lower()
-    if mode not in VALID_MODES:
-        await update.message.reply_text("Режим только office или home")
-        return
-    if day.weekday() >= 5:
-        await update.message.reply_text("Суббота и воскресенье всегда выходные.")
-        return
-    if mode == WORK_MODE_HOME:
-        db.set_home_day(user.user_id, day.isoformat())
-    else:
-        db.remove_home_day(user.user_id, day.isoformat())
-    await update.message.reply_text(f"Записал: {day.isoformat()} — {mode_label(day_status(db, user.user_id, day))}")
-
-
-async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    db: ScheduleDB = context.application.bot_data["db"]
-    user = ensure_registered_user(update, db)
-    if not profile_complete(user):
-        await prompt_choose_name_message(update)
-        return
-    if len(context.args) != 1:
-        await update.message.reply_text("Формат: /delete YYYY-MM-DD")
-        return
-    try:
-        day = parse_date_arg(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Неверная дата. Используй формат YYYY-MM-DD")
-        return
-    deleted = db.remove_home_day(user.user_id, day.isoformat())
-    if deleted:
-        await update.message.reply_text(f"Удалил запись за {day.isoformat()}")
-    else:
-        await update.message.reply_text(f"На {day.isoformat()} записи не было")
-
-
-async def myday_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    db: ScheduleDB = context.application.bot_data["db"]
-    user = ensure_registered_user(update, db)
-    if not profile_complete(user):
-        await prompt_choose_name_message(update)
-        return
-    try:
-        day = parse_date_arg(context.args[0] if context.args else None)
-    except ValueError:
-        await update.message.reply_text("Неверная дата. Используй формат YYYY-MM-DD")
-        return
-    mode = day_status(db, user.user_id, day)
-    await update.message.reply_text(
-        f"{day.isoformat()}: {mode_label(mode)}"
-    )
-
-
-async def calendar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    db: ScheduleDB = context.application.bot_data["db"]
-    user = ensure_registered_user(update, db)
-    if not require_active_user(user):
-        await update.message.reply_text("Ты отключен администратором. Обратись к администратору.")
-        return
-    if not profile_complete(user):
-        await prompt_choose_name_message(update)
-        return
-    if context.args:
-        try:
-            year_text, month_text = context.args[0].split("-")
-            year = int(year_text)
-            month = int(month_text)
-            _ = date(year, month, 1)
-        except (ValueError, IndexError):
-            await update.message.reply_text("Формат: /calendar YYYY-MM")
-            return
-    else:
-        today = date.today()
-        year, month = today.year, today.month
-    context.user_data[CAL_CURRENT_MONTH_KEY] = f"{year:04d}-{month:02d}"
-    context.user_data[CAL_SELECTED_DAYS_KEY] = []
-    first_day, last_day = month_bounds(year, month)
-    text = (
-        f"<b>{month_title(year, month)}</b>\n"
-        "Несколько будней → действие внизу.\n"
-        "Сб и Вс без выбора.\n\n"
-        f"{first_day.isoformat()} — {last_day.isoformat()}"
-    )
-    await update.message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=build_month_keyboard(db, user.user_id, year, month, set()),
-    )
-
-
-async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if query is None or query.data is None:
-        return
-    await query.answer()
-    db: ScheduleDB = context.application.bot_data["db"]
-    user = ensure_registered_user(update, db)
-    if not require_active_user(user):
-        await query.edit_message_text("Ты отключен администратором. Обратись к администратору.")
-        return
-    if not profile_complete(user):
-        await prompt_choose_name_callback(query)
-        return
-
-    data = query.data
-    if data == "cal:noop":
-        return
-    if data == "cal:close":
-        await query.edit_message_text("Календарь закрыт.")
-        return
-    if data.startswith("cal:nav:"):
-        year_text, month_text = data.split(":", 2)[2].split("-")
-        year = int(year_text)
-        month = int(month_text)
-        context.user_data[CAL_CURRENT_MONTH_KEY] = f"{year:04d}-{month:02d}"
-        context.user_data[CAL_SELECTED_DAYS_KEY] = []
-        first_day, last_day = month_bounds(year, month)
-        text = (
-            f"<b>{month_title(year, month)}</b>\n"
-            "Несколько будней → действие внизу.\n"
-            "Сб и Вс без выбора.\n\n"
-            f"{first_day.isoformat()} — {last_day.isoformat()}"
-        )
-        await query.edit_message_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=build_month_keyboard(db, user.user_id, year, month, set()),
-        )
-        return
-    if data == "cal:clear":
-        context.user_data[CAL_SELECTED_DAYS_KEY] = []
-        ym = context.user_data.get(CAL_CURRENT_MONTH_KEY)
-        if ym is None:
-            today = date.today()
-            ym = f"{today.year:04d}-{today.month:02d}"
-        year_text, month_text = ym.split("-")
-        year = int(year_text)
-        month = int(month_text)
-        first_day, last_day = month_bounds(year, month)
-        text = (
-            f"<b>{month_title(year, month)}</b>\n"
-            "Выбор сброшен.\n\n"
-            f"{first_day.isoformat()} — {last_day.isoformat()}"
-        )
-        await query.edit_message_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=build_month_keyboard(db, user.user_id, year, month, set()),
-        )
-        return
-    if data.startswith("cal:sel:"):
-        picked_day = datetime.strptime(data.split(":", 2)[2], "%Y-%m-%d").date()
-        if picked_day.weekday() >= 5:
-            await query.answer("Сб/Вс всегда выходные", show_alert=True)
-            return
-        current_ym = context.user_data.get(CAL_CURRENT_MONTH_KEY, "")
-        picked_ym = f"{picked_day.year:04d}-{picked_day.month:02d}"
-        if current_ym != picked_ym:
-            context.user_data[CAL_CURRENT_MONTH_KEY] = picked_ym
-            context.user_data[CAL_SELECTED_DAYS_KEY] = []
-        selected_days = set(context.user_data.get(CAL_SELECTED_DAYS_KEY, []))
-        picked_iso = picked_day.isoformat()
-        if picked_iso in selected_days:
-            selected_days.remove(picked_iso)
-        else:
-            selected_days.add(picked_iso)
-        context.user_data[CAL_SELECTED_DAYS_KEY] = sorted(selected_days)
-        first_day, last_day = month_bounds(picked_day.year, picked_day.month)
-        text = (
-            f"<b>{month_title(picked_day.year, picked_day.month)}</b>\n"
-            f"Выбрано: <b>{len(selected_days)}</b>\n\n"
-            f"{first_day.isoformat()} — {last_day.isoformat()}"
-        )
-        await query.edit_message_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=build_month_keyboard(
-                db,
-                user.user_id,
-                picked_day.year,
-                picked_day.month,
-                selected_days,
-            ),
-        )
-        return
-    if data.startswith("cal:apply:") or data.startswith("cal:remove:"):
-        is_apply = data.startswith("cal:apply:")
-        ym = data.split(":", 2)[2]
-        year_text, month_text = ym.split("-")
-        year = int(year_text)
-        month = int(month_text)
-        selected_days = set(context.user_data.get(CAL_SELECTED_DAYS_KEY, []))
-        changed = 0
-        for day_iso in sorted(selected_days):
-            current = datetime.strptime(day_iso, "%Y-%m-%d").date()
-            if current.year != year or current.month != month or current.weekday() >= 5:
-                continue
-            if is_apply:
-                db.set_home_day(user.user_id, day_iso)
-            else:
-                db.remove_home_day(user.user_id, day_iso)
-            changed += 1
-        context.user_data[CAL_SELECTED_DAYS_KEY] = []
-        first_day, last_day = month_bounds(year, month)
-        action_label = "дом" if is_apply else "снято"
-        text = (
-            f"<b>{month_title(year, month)}</b>\n"
-            f"Изменено дней: <b>{changed}</b> ({action_label})\n\n"
-            f"{first_day.isoformat()} — {last_day.isoformat()}"
-        )
-        await query.edit_message_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=build_month_keyboard(db, user.user_id, year, month, set()),
-        )
-        return
-    if data.startswith("cal:togday:"):
-        picked_day = datetime.strptime(data.split(":", 2)[2], "%Y-%m-%d").date()
-        if picked_day.weekday() >= 5:
-            await query.answer("Сб/Вс всегда выходные", show_alert=True)
-            return
-        if db.is_home_day(user.user_id, picked_day.isoformat()):
-            db.remove_home_day(user.user_id, picked_day.isoformat())
-        else:
-            db.set_home_day(user.user_id, picked_day.isoformat())
-        text = (
-            f"<b>{picked_day.strftime('%d.%m.%Y · %A')}</b>\n"
-            f"Статус: <b>{mode_label(day_status(db, user.user_id, picked_day))}</b>\n"
-            "Действие:"
-        )
-        await query.edit_message_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=build_day_editor_keyboard(db, user.user_id, picked_day),
-        )
-        return
-    if data.startswith("cal:togweek:"):
-        picked_day = datetime.strptime(data.split(":", 2)[2], "%Y-%m-%d").date()
-        weekday = picked_day.weekday()
-        if weekday >= 5:
-            await query.answer("Для выходных недоступно", show_alert=True)
-            return
-        if db.is_weekly_home_day(user.user_id, weekday):
-            db.remove_weekly_home_day(user.user_id, weekday)
-        else:
-            db.set_weekly_home_day(user.user_id, weekday)
-        text = (
-            f"<b>{picked_day.strftime('%d.%m.%Y · %A')}</b>\n"
-            f"Статус: <b>{mode_label(day_status(db, user.user_id, picked_day))}</b>\n"
-            "Действие:"
-        )
-        await query.edit_message_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=build_day_editor_keyboard(db, user.user_id, picked_day),
-        )
-        return
-
-
-async def day_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    db: ScheduleDB = context.application.bot_data["db"]
-    user = ensure_registered_user(update, db)
-    if not profile_complete(user):
-        await prompt_choose_name_message(update)
-        return
-    try:
-        day = parse_date_arg(context.args[0] if context.args else None)
-    except ValueError:
-        await update.message.reply_text("Неверная дата. Используй формат YYYY-MM-DD")
-        return
-    await update.message.reply_text(render_day(db, day), parse_mode=ParseMode.HTML)
-
-
-async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    db: ScheduleDB = context.application.bot_data["db"]
-    user = ensure_registered_user(update, db)
-    if not profile_complete(user):
-        await prompt_choose_name_message(update)
-        return
-    try:
-        anchor = parse_date_arg(context.args[0] if context.args else None)
-    except ValueError:
-        await update.message.reply_text("Неверная дата. Используй формат YYYY-MM-DD")
-        return
-
-    start, end = week_bounds(anchor)
-    parts = [f"<b>Неделя {start.isoformat()} — {end.isoformat()}</b>"]
-    for day in iter_week_days(anchor):
-        parts.append("")
-        parts.append(render_day(db, day))
-    await update.message.reply_text("\n".join(parts), parse_mode=ParseMode.HTML)
-
-
 async def participants_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db: ScheduleDB = context.application.bot_data["db"]
     user = ensure_registered_user(update, db)
@@ -1071,15 +677,12 @@ async def post_init(app: Application) -> None:
             BotCommand("start", "Старт и имя"),
             BotCommand("app", "Мини-приложение"),
             BotCommand("name", "Сменить имя"),
-            BotCommand("calendar", "Календарь"),
-            BotCommand("day", "День"),
-            BotCommand("week", "Неделя"),
-            BotCommand("myday", "Мой статус"),
             BotCommand("participants", "Участники"),
-            BotCommand("menu", "Кнопки команд"),
+            BotCommand("menu", "Кнопки"),
             BotCommand("help", "Помощь"),
         ]
     )
+    register_digest_job(app)
 
 
 def main() -> None:
@@ -1100,16 +703,9 @@ def main() -> None:
     app.add_handler(CommandHandler("name", name_cmd))
     app.add_handler(CommandHandler("app", app_cmd))
     app.add_handler(CommandHandler("menu", menu_cmd))
-    app.add_handler(CommandHandler("calendar", calendar_cmd))
-    app.add_handler(CommandHandler("set", set_cmd))
-    app.add_handler(CommandHandler("delete", delete_cmd))
-    app.add_handler(CommandHandler("myday", myday_cmd))
-    app.add_handler(CommandHandler("day", day_cmd))
-    app.add_handler(CommandHandler("week", week_cmd))
     app.add_handler(CommandHandler("participants", participants_cmd))
     app.add_handler(CommandHandler("remove_participant", remove_participant_cmd))
     app.add_handler(CallbackQueryHandler(name_callback, pattern=r"^name:"))
-    app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal:"))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
 
     logger.info("Bot started")
