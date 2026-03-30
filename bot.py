@@ -30,6 +30,8 @@ WORK_MODE_HOME = "home"
 WORK_MODE_OFF = "off"
 VALID_MODES = {WORK_MODE_OFFICE, WORK_MODE_HOME}
 WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+CAL_SELECTED_DAYS_KEY = "cal_selected_days"
+CAL_CURRENT_MONTH_KEY = "cal_current_month"
 MAIN_COMMAND_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["/calendar", "/day", "/week"],
@@ -358,7 +360,13 @@ def shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
     return total // 12, total % 12 + 1
 
 
-def build_month_keyboard(db: ScheduleDB, user_id: int, year: int, month: int) -> InlineKeyboardMarkup:
+def build_month_keyboard(
+    db: ScheduleDB,
+    user_id: int,
+    year: int,
+    month: int,
+    selected_days: set[str],
+) -> InlineKeyboardMarkup:
     keyboard: list[list[InlineKeyboardButton]] = []
     keyboard.append([InlineKeyboardButton(day, callback_data="cal:noop") for day in WEEKDAYS_RU])
     for week in calendar.monthcalendar(year, month):
@@ -368,15 +376,35 @@ def build_month_keyboard(db: ScheduleDB, user_id: int, year: int, month: int) ->
                 row.append(InlineKeyboardButton(" ", callback_data="cal:noop"))
                 continue
             current = date(year, month, day_num)
-            status = day_status(db, user_id, current)
-            suffix = "🏠" if status == WORK_MODE_HOME else ("⛔" if status == WORK_MODE_OFF else "🏢")
+            iso = current.isoformat()
+            if iso in selected_days:
+                label = f"[{day_num}]"
+            else:
+                status = day_status(db, user_id, current)
+                if status == WORK_MODE_HOME:
+                    label = f"{day_num}Д"
+                elif status == WORK_MODE_OFF:
+                    label = f"{day_num}В"
+                else:
+                    label = str(day_num)
             row.append(
                 InlineKeyboardButton(
-                    f"{day_num}{suffix}",
-                    callback_data=f"cal:pick:{current.isoformat()}",
+                    label,
+                    callback_data=f"cal:sel:{iso}",
                 )
             )
         keyboard.append(row)
+    keyboard.append(
+        [
+            InlineKeyboardButton("Сохранить выбранные как Дом", callback_data=f"cal:apply:{year:04d}-{month:02d}"),
+        ]
+    )
+    keyboard.append(
+        [
+            InlineKeyboardButton("Снять Дом с выбранных", callback_data=f"cal:remove:{year:04d}-{month:02d}"),
+            InlineKeyboardButton("Очистить выбор", callback_data="cal:clear"),
+        ]
+    )
     prev_y, prev_m = shift_month(year, month, -1)
     next_y, next_m = shift_month(year, month, 1)
     keyboard.append(
@@ -551,17 +579,19 @@ async def calendar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         today = date.today()
         year, month = today.year, today.month
+    context.user_data[CAL_CURRENT_MONTH_KEY] = f"{year:04d}-{month:02d}"
+    context.user_data[CAL_SELECTED_DAYS_KEY] = []
     first_day, last_day = month_bounds(year, month)
     text = (
         f"📆 <b>{month_title(year, month)}</b>\n"
-        "Выбери день, чтобы отметить 'дом'.\n"
+        "Выбери несколько будних дней, затем примени действие кнопкой ниже.\n"
         "Сб/Вс всегда выходные.\n\n"
         f"Период: {first_day.isoformat()} — {last_day.isoformat()}"
     )
     await update.message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
-        reply_markup=build_month_keyboard(db, user.user_id, year, month),
+        reply_markup=build_month_keyboard(db, user.user_id, year, month, set()),
     )
 
 
@@ -586,30 +616,109 @@ async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         year_text, month_text = data.split(":", 2)[2].split("-")
         year = int(year_text)
         month = int(month_text)
+        context.user_data[CAL_CURRENT_MONTH_KEY] = f"{year:04d}-{month:02d}"
+        context.user_data[CAL_SELECTED_DAYS_KEY] = []
         first_day, last_day = month_bounds(year, month)
         text = (
             f"📆 <b>{month_title(year, month)}</b>\n"
-            "Выбери день, чтобы отметить 'дом'.\n"
+            "Выбери несколько будних дней, затем примени действие кнопкой ниже.\n"
             "Сб/Вс всегда выходные.\n\n"
             f"Период: {first_day.isoformat()} — {last_day.isoformat()}"
         )
         await query.edit_message_text(
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=build_month_keyboard(db, user.user_id, year, month),
+            reply_markup=build_month_keyboard(db, user.user_id, year, month, set()),
         )
         return
-    if data.startswith("cal:pick:"):
-        picked_day = datetime.strptime(data.split(":", 2)[2], "%Y-%m-%d").date()
+    if data == "cal:clear":
+        context.user_data[CAL_SELECTED_DAYS_KEY] = []
+        ym = context.user_data.get(CAL_CURRENT_MONTH_KEY)
+        if ym is None:
+            today = date.today()
+            ym = f"{today.year:04d}-{today.month:02d}"
+        year_text, month_text = ym.split("-")
+        year = int(year_text)
+        month = int(month_text)
+        first_day, last_day = month_bounds(year, month)
         text = (
-            f"🛠 <b>{picked_day.strftime('%d.%m.%Y (%A)')}</b>\n"
-            f"Текущий статус: <b>{mode_label(day_status(db, user.user_id, picked_day))}</b>\n"
-            "Выбери действие:"
+            f"📆 <b>{month_title(year, month)}</b>\n"
+            "Выбор очищен.\n"
+            "Сб/Вс всегда выходные.\n\n"
+            f"Период: {first_day.isoformat()} — {last_day.isoformat()}"
         )
         await query.edit_message_text(
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=build_day_editor_keyboard(db, user.user_id, picked_day),
+            reply_markup=build_month_keyboard(db, user.user_id, year, month, set()),
+        )
+        return
+    if data.startswith("cal:sel:"):
+        picked_day = datetime.strptime(data.split(":", 2)[2], "%Y-%m-%d").date()
+        if picked_day.weekday() >= 5:
+            await query.answer("Сб/Вс всегда выходные", show_alert=True)
+            return
+        current_ym = context.user_data.get(CAL_CURRENT_MONTH_KEY, "")
+        picked_ym = f"{picked_day.year:04d}-{picked_day.month:02d}"
+        if current_ym != picked_ym:
+            context.user_data[CAL_CURRENT_MONTH_KEY] = picked_ym
+            context.user_data[CAL_SELECTED_DAYS_KEY] = []
+        selected_days = set(context.user_data.get(CAL_SELECTED_DAYS_KEY, []))
+        picked_iso = picked_day.isoformat()
+        if picked_iso in selected_days:
+            selected_days.remove(picked_iso)
+        else:
+            selected_days.add(picked_iso)
+        context.user_data[CAL_SELECTED_DAYS_KEY] = sorted(selected_days)
+        first_day, last_day = month_bounds(picked_day.year, picked_day.month)
+        text = (
+            f"📆 <b>{month_title(picked_day.year, picked_day.month)}</b>\n"
+            f"Выбрано дней: <b>{len(selected_days)}</b>\n"
+            "Сб/Вс всегда выходные.\n\n"
+            f"Период: {first_day.isoformat()} — {last_day.isoformat()}"
+        )
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_month_keyboard(
+                db,
+                user.user_id,
+                picked_day.year,
+                picked_day.month,
+                selected_days,
+            ),
+        )
+        return
+    if data.startswith("cal:apply:") or data.startswith("cal:remove:"):
+        is_apply = data.startswith("cal:apply:")
+        ym = data.split(":", 2)[2]
+        year_text, month_text = ym.split("-")
+        year = int(year_text)
+        month = int(month_text)
+        selected_days = set(context.user_data.get(CAL_SELECTED_DAYS_KEY, []))
+        changed = 0
+        for day_iso in sorted(selected_days):
+            current = datetime.strptime(day_iso, "%Y-%m-%d").date()
+            if current.year != year or current.month != month or current.weekday() >= 5:
+                continue
+            if is_apply:
+                db.set_home_day(user.user_id, day_iso)
+            else:
+                db.remove_home_day(user.user_id, day_iso)
+            changed += 1
+        context.user_data[CAL_SELECTED_DAYS_KEY] = []
+        first_day, last_day = month_bounds(year, month)
+        action_label = "назначены как Дом" if is_apply else "сняты с Дома"
+        text = (
+            f"📆 <b>{month_title(year, month)}</b>\n"
+            f"Обновлено дней: <b>{changed}</b> ({action_label})\n"
+            "Сб/Вс всегда выходные.\n\n"
+            f"Период: {first_day.isoformat()} — {last_day.isoformat()}"
+        )
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_month_keyboard(db, user.user_id, year, month, set()),
         )
         return
     if data.startswith("cal:togday:"):
