@@ -493,7 +493,7 @@ def register_digest_job(app: Application) -> None:
         tz = ZoneInfo(tz_name)
     except Exception:
         tz = ZoneInfo("UTC")
-    h = int(os.getenv("DIGEST_HOUR", "9"))
+    h = int(os.getenv("DIGEST_HOUR", "8"))
     mi = int(os.getenv("DIGEST_MINUTE", "0"))
     run_at = time(hour=h, minute=mi, tzinfo=tz)
     jq.run_daily(daily_digest_job, time=run_at, name="daily_digest")

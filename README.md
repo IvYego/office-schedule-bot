@@ -49,7 +49,7 @@ python bot.py
 | Переменная | По умолчанию |
 |------------|----------------|
 | `DIGEST_ENABLED` | `true` |
-| `DIGEST_HOUR` | `9` |
+| `DIGEST_HOUR` | `8` |
 | `DIGEST_MINUTE` | `0` |
 | `DIGEST_TIMEZONE` | `Europe/Moscow` |
 
