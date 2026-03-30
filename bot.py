@@ -10,9 +10,11 @@ from telegram import (
     BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     Update,
+    WebAppInfo,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -52,14 +54,30 @@ TEAM_NAMES = (
 )
 TEAM_NAMES_SET = frozenset(TEAM_NAMES)
 
-MAIN_COMMAND_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        ["/calendar", "/day", "/week"],
-        ["/myday", "/participants", "/help"],
-    ],
-    resize_keyboard=True,
-    is_persistent=True,
-)
+def main_reply_keyboard() -> ReplyKeyboardMarkup:
+    url = os.getenv("MINIAPP_URL", "").strip()
+    row_a: list[KeyboardButton] = []
+    if url:
+        row_a.append(KeyboardButton("Приложение", web_app=WebAppInfo(url=url)))
+    row_a.extend(
+        [
+            KeyboardButton("/calendar"),
+            KeyboardButton("/day"),
+        ]
+    )
+    return ReplyKeyboardMarkup(
+        [
+            row_a,
+            [
+                KeyboardButton("/week"),
+                KeyboardButton("/myday"),
+                KeyboardButton("/participants"),
+            ],
+            [KeyboardButton("/help")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
 @dataclass
@@ -364,11 +382,15 @@ def build_name_keyboard() -> InlineKeyboardMarkup:
 
 def welcome_after_onboarding_html(user: UserRecord) -> str:
     name = user_public_name(user)
+    extra = ""
+    if os.getenv("MINIAPP_URL", "").strip():
+        extra = "\n\nКнопка <b>Приложение</b> — календарь на весь экран."
     return (
         f"<b>{name}</b>\n"
         "Календарь — дни «дом». Будни без отметки — офис. Сб и Вс — выходной.\n\n"
         "<code>/calendar</code>  <code>/day</code>  <code>/week</code>\n"
         "<code>/myday</code>  <code>/participants</code>  <code>/name</code>"
+        f"{extra}"
     )
 
 
@@ -578,7 +600,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         welcome_after_onboarding_html(user),
         parse_mode=ParseMode.HTML,
-        reply_markup=MAIN_COMMAND_KEYBOARD,
+        reply_markup=main_reply_keyboard(),
     )
 
 
@@ -597,7 +619,30 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         welcome_after_onboarding_html(user),
         parse_mode=ParseMode.HTML,
-        reply_markup=MAIN_COMMAND_KEYBOARD,
+        reply_markup=main_reply_keyboard(),
+    )
+
+
+async def app_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    url = os.getenv("MINIAPP_URL", "").strip()
+    if not url:
+        await update.message.reply_text("Мини-приложение не настроено (нет MINIAPP_URL на сервере).")
+        return
+    db: ScheduleDB = context.application.bot_data["db"]
+    user = ensure_registered_user(update, db)
+    if not require_active_user(user):
+        await update.message.reply_text("Доступ отключён.")
+        return
+    if not profile_complete(user):
+        await prompt_choose_name_message(update)
+        return
+    await update.message.reply_text(
+        "Открой <b>Приложение</b> — полноэкранный календарь.\nПосле выхода: /menu — обычные кнопки.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ReplyKeyboardMarkup(
+            [[KeyboardButton("Приложение", web_app=WebAppInfo(url=url))]],
+            resize_keyboard=True,
+        ),
     )
 
 
@@ -607,7 +652,7 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not profile_complete(user):
         await prompt_choose_name_message(update)
         return
-    await update.message.reply_text("Команды", reply_markup=MAIN_COMMAND_KEYBOARD)
+    await update.message.reply_text("Команды", reply_markup=main_reply_keyboard())
 
 
 async def name_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -654,7 +699,7 @@ async def name_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await query.message.reply_text(
         welcome_after_onboarding_html(refreshed),
         parse_mode=ParseMode.HTML,
-        reply_markup=MAIN_COMMAND_KEYBOARD,
+        reply_markup=main_reply_keyboard(),
     )
 
 
@@ -1024,6 +1069,7 @@ async def post_init(app: Application) -> None:
     await app.bot.set_my_commands(
         [
             BotCommand("start", "Старт и имя"),
+            BotCommand("app", "Мини-приложение"),
             BotCommand("name", "Сменить имя"),
             BotCommand("calendar", "Календарь"),
             BotCommand("day", "День"),
@@ -1052,6 +1098,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("name", name_cmd))
+    app.add_handler(CommandHandler("app", app_cmd))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("calendar", calendar_cmd))
     app.add_handler(CommandHandler("set", set_cmd))

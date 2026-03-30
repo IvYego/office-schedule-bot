@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <title>Расписание</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <div id="gate" class="panel hidden">
+      <p class="lead" id="gate-msg"></p>
+      <p class="hint">Закрой приложение и открой чат с ботом.</p>
+    </div>
+
+    <div id="main" class="hidden">
+      <header class="hero">
+        <div class="hero-top">
+          <span class="hero-label">Офис · расписание</span>
+          <span class="hero-name" id="hero-name"></span>
+        </div>
+        <p class="hero-sub">Дом отмечаешь здесь. Будни без метки — офис. Сб · Вс — выходной.</p>
+      </header>
+
+      <section class="card">
+        <div class="card-head">
+          <button type="button" class="icon-btn" id="btn-prev" aria-label="Прошлый месяц">‹</button>
+          <h1 class="month-title" id="month-title"></h1>
+          <button type="button" class="icon-btn" id="btn-next" aria-label="Следующий месяц">›</button>
+        </div>
+        <div class="weekdays" id="weekdays"></div>
+        <div class="grid" id="grid"></div>
+        <div class="toolbar">
+          <span class="selection-hint" id="selection-count">Выбрано: 0</span>
+          <div class="toolbar-actions">
+            <button type="button" class="btn secondary" id="btn-clear">Сбросить выбор</button>
+            <button type="button" class="btn primary" id="btn-apply-home">Дом</button>
+            <button type="button" class="btn ghost" id="btn-remove-home">Снять</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
