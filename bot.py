@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Iterable, Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -30,6 +30,14 @@ WORK_MODE_HOME = "home"
 WORK_MODE_OFF = "off"
 VALID_MODES = {WORK_MODE_OFFICE, WORK_MODE_HOME}
 WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+MAIN_COMMAND_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["/calendar", "/day", "/week"],
+        ["/myday", "/participants", "/help"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
 
 
 @dataclass
@@ -450,12 +458,19 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/myday [YYYY-MM-DD] — моя запись на день\n"
         "/delete YYYY-MM-DD — удалить свою запись\n"
         "/participants — список участников\n"
-        "/help — помощь"
+        "/menu — показать кнопки\n"
+        "/help — помощь",
+        reply_markup=MAIN_COMMAND_KEYBOARD,
     )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await start_cmd(update, context)
+
+
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ensure_registered_user(update, context.application.bot_data["db"])
+    await update.message.reply_text("Кнопки команд включены.", reply_markup=MAIN_COMMAND_KEYBOARD)
 
 
 async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -718,6 +733,21 @@ def require_env(name: str) -> str:
     return value
 
 
+async def post_init(app: Application) -> None:
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "Запуск и регистрация"),
+            BotCommand("calendar", "Календарь дней из дома"),
+            BotCommand("day", "Расписание на день"),
+            BotCommand("week", "Расписание на неделю"),
+            BotCommand("myday", "Мой статус на день"),
+            BotCommand("participants", "Список участников"),
+            BotCommand("menu", "Показать кнопки команд"),
+            BotCommand("help", "Помощь"),
+        ]
+    )
+
+
 def main() -> None:
     token = require_env("BOT_TOKEN")
     db_path = os.getenv("DB_PATH", "schedule.db")
@@ -727,12 +757,13 @@ def main() -> None:
         raise RuntimeError("ADMIN_IDS must contain at least one Telegram user id")
 
     db = ScheduleDB(db_path)
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(post_init).build()
     app.bot_data["db"] = db
     app.bot_data["admins"] = admins
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("calendar", calendar_cmd))
     app.add_handler(CommandHandler("set", set_cmd))
     app.add_handler(CommandHandler("delete", delete_cmd))
